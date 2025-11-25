@@ -15,6 +15,7 @@ import {
   findStakingPool,
   findUserAccount,
   findUserStake,
+  findUserStakePosition,
 } from "./pdas";
 
 /**
@@ -100,7 +101,8 @@ export function ixInitializeTreasuryVault(params: {
   return ix("initialize_treasury_vault", [], [
     { pubkey: admin, isSigner: true, isWritable: true },
     { pubkey: globalConfig, isSigner: false, isWritable: true },
-    { pubkey: xntMint, isSigner: false, isWritable: false },
+    // Mint must be writable to satisfy Anchor mut constraint
+    { pubkey: xntMint, isSigner: false, isWritable: true },
     { pubkey: treasuryXntVault, isSigner: false, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
@@ -120,7 +122,8 @@ export function ixInitializeStakingPool(params: {
     { pubkey: admin, isSigner: true, isWritable: true },
     { pubkey: globalConfig, isSigner: false, isWritable: true },
     { pubkey: stakingPool, isSigner: false, isWritable: true },
-    { pubkey: gameMint, isSigner: false, isWritable: false },
+    // gameMint has mut constraint in program, must be writable
+    { pubkey: gameMint, isSigner: false, isWritable: true },
     { pubkey: xntMint, isSigner: false, isWritable: false },
     { pubkey: stakingVault, isSigner: false, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
@@ -165,11 +168,25 @@ export function ixStake(params: {
   userXntAccount: PublicKey;
   amount: BNish;
   lockDays: number;
+  positionId: number;
 }) {
-  const { owner, stakingVault, treasuryXntVault, userGameAccount, userXntAccount, amount, lockDays } = params;
+  const {
+    owner,
+    stakingVault,
+    treasuryXntVault,
+    userGameAccount,
+    userXntAccount,
+    amount,
+    lockDays,
+    positionId,
+  } = params;
   const [globalConfig] = findGlobalConfig(PROGRAM_ID);
   const [stakingPool] = findStakingPool(PROGRAM_ID);
-  const [userStakePosition] = findUserStake(owner, PROGRAM_ID);
+  const [userStakePosition] = findUserStakePosition(
+    owner,
+    positionId,
+    PROGRAM_ID
+  );
   const [userAccount] = findUserAccount(owner, PROGRAM_ID);
   return ix("stake", [toU64(amount), toU16(lockDays)], [
     { pubkey: owner, isSigner: true, isWritable: true },
@@ -192,11 +209,15 @@ export function ixClaim(params: {
   owner: PublicKey;
   treasuryXntVault: PublicKey;
   userXntAccount: PublicKey;
+  positionId: number;
 }) {
-  const { owner, treasuryXntVault, userXntAccount } = params;
+  const { owner, treasuryXntVault, userXntAccount, positionId } = params;
   const [globalConfig] = findGlobalConfig(PROGRAM_ID);
   const [stakingPool] = findStakingPool(PROGRAM_ID);
-  const [userStakePosition] = findUserStake(owner, PROGRAM_ID);
+  const [userStakePosition] =
+    positionId === 0
+      ? findUserStake(owner, PROGRAM_ID)
+      : findUserStakePosition(owner, positionId, PROGRAM_ID);
   return ix("claim", [], [
     { pubkey: owner, isSigner: true, isWritable: true },
     { pubkey: globalConfig, isSigner: false, isWritable: true },
@@ -214,11 +235,22 @@ export function ixUnstake(params: {
   treasuryXntVault: PublicKey;
   userGameAccount: PublicKey;
   userXntAccount: PublicKey;
-  userStakePosition: PublicKey;
+  positionId: number;
 }) {
-  const { owner, stakingVault, treasuryXntVault, userGameAccount, userXntAccount, userStakePosition } = params;
+  const {
+    owner,
+    stakingVault,
+    treasuryXntVault,
+    userGameAccount,
+    userXntAccount,
+    positionId,
+  } = params;
   const [globalConfig] = findGlobalConfig(PROGRAM_ID);
   const [stakingPool] = findStakingPool(PROGRAM_ID);
+  const [stakePosition] =
+    positionId === 0
+      ? findUserStake(owner, PROGRAM_ID)
+      : findUserStakePosition(owner, positionId, PROGRAM_ID);
   return ix("unstake", [], [
     { pubkey: owner, isSigner: true, isWritable: true },
     { pubkey: globalConfig, isSigner: false, isWritable: true },
@@ -227,7 +259,7 @@ export function ixUnstake(params: {
     { pubkey: treasuryXntVault, isSigner: false, isWritable: true },
     { pubkey: userGameAccount, isSigner: false, isWritable: true },
     { pubkey: userXntAccount, isSigner: false, isWritable: true },
-    { pubkey: userStakePosition, isSigner: false, isWritable: true },
+    { pubkey: stakePosition, isSigner: false, isWritable: true },
     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
   ]);
 }
@@ -247,6 +279,68 @@ export function ixActivateBoost(params: {
     { pubkey: userAccount, isSigner: false, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
   ]);
+}
+
+export function ixUpsertBoostConfig(params: {
+  admin: PublicKey;
+  id: number;
+  kind: number; // 0: MiningRewardBps, 1: MiningPointsBps, 2: FreeRigTicket, 3: StakingMultiplierBps
+  costBoostPoints: bigint;
+  valueBps: number;
+  durationSeconds: bigint;
+  rigId?: number;
+}) {
+  const {
+    admin,
+    id,
+    kind,
+    costBoostPoints,
+    valueBps,
+    durationSeconds,
+    rigId,
+  } = params;
+  const [globalConfig] = findGlobalConfig(PROGRAM_ID);
+  const [boostConfig] = findBoostConfig(id, PROGRAM_ID);
+
+  // encode args manually: id(u8) kind(u8) cost(u64) value_bps(u16) duration(i64) rig_id(option u8)
+  const buf = Buffer.alloc(8 + 1 + 1 + 8 + 2 + 8 + 2); // discriminator + fields (rig option up to 2 bytes)
+  const disc = createHash("sha256")
+    .update("global:upsert_boost_config")
+    .digest()
+    .subarray(0, 8);
+  disc.copy(buf, 0);
+  let offset = 8;
+  buf.writeUInt8(id, offset);
+  offset += 1;
+  buf.writeUInt8(kind, offset);
+  offset += 1;
+  buf.writeBigUInt64LE(BigInt(costBoostPoints), offset);
+  offset += 8;
+  buf.writeUInt16LE(valueBps, offset);
+  offset += 2;
+  buf.writeBigInt64LE(BigInt(durationSeconds), offset);
+  offset += 8;
+  if (rigId !== undefined) {
+    buf.writeUInt8(1, offset);
+    offset += 1;
+    buf.writeUInt8(rigId, offset);
+    offset += 1;
+  } else {
+    buf.writeUInt8(0, offset);
+    offset += 1;
+  }
+  const data = buf.subarray(0, offset);
+
+  return new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      { pubkey: admin, isSigner: true, isWritable: true },
+      { pubkey: globalConfig, isSigner: false, isWritable: true },
+      { pubkey: boostConfig, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
 }
 
 export function ixApplyRankingResults(params: {

@@ -1,7 +1,8 @@
 import { PublicKey } from "@solana/web3.js";
+import { Keypair } from "@solana/web3.js";
 import { ixInitializeTreasuryVault, PROGRAM_ID } from "../sdk/client";
 import { findGlobalConfig } from "../sdk/pdas";
-import { ensureAta, getConnection, loadKeypair, sendTx } from "./helpers";
+import { getConnection, loadKeypair, sendTx } from "./helpers";
 
 async function main() {
   const walletPath =
@@ -15,13 +16,8 @@ async function main() {
 
   const [globalConfig, globalBump] = findGlobalConfig(PROGRAM_ID);
 
-  // Treasury vault ATA owned by GlobalConfig PDA.
-  const treasuryAta = await ensureAta({
-    connection,
-    payer: admin,
-    mint: XNT_MINT,
-    owner: globalConfig,
-  });
+  // Create a fresh token account keypair for the treasury vault; program will init it.
+  const treasuryVaultKp = Keypair.generate();
 
   const sig = await sendTx(
     connection,
@@ -30,15 +26,19 @@ async function main() {
       ixInitializeTreasuryVault({
         admin: admin.publicKey,
         xntMint: XNT_MINT,
-        treasuryXntVault: treasuryAta,
+        treasuryXntVault: treasuryVaultKp.publicKey,
       }),
     ],
-    []
+    [treasuryVaultKp]
   );
 
   console.log("initializeTreasuryVault signature:", sig);
   console.log("GlobalConfig PDA:", globalConfig.toBase58(), "bump", globalBump);
-  console.log("Treasury XNT ATA (owner = global_config):", treasuryAta.toBase58());
+  console.log(
+    "Treasury XNT vault:",
+    treasuryVaultKp.publicKey.toBase58(),
+    "(keypair generated in script)"
+  );
 }
 
 main().catch((e) => {

@@ -236,6 +236,9 @@ pub mod x1_mining_arena {
             ArenaError::Unauthorized
         );
 
+        let position_id = user_account.next_position_id.max(1);
+        user_account.next_position_id = position_id;
+
         let lock_multiplier_bps = lock_multiplier(lock_days)?;
         let boost_multiplier_bps = resolve_staking_multiplier(user_account, clock.unix_timestamp);
 
@@ -243,21 +246,12 @@ pub mod x1_mining_arena {
         if stake_position.owner == Pubkey::default() {
             stake_position.owner = ctx.accounts.owner.key();
         }
+        stake_position.position_id = position_id;
         require_keys_eq!(
             stake_position.owner,
             ctx.accounts.owner.key(),
             ArenaError::Unauthorized
         );
-
-        settle_rewards(
-            &mut ctx.accounts.staking_pool,
-            stake_position,
-            &ctx.accounts.global_config,
-            &ctx.accounts.treasury_xnt_vault,
-            &ctx.accounts.user_xnt_account,
-            &ctx.accounts.token_program,
-            ctx.bumps.global_config,
-        )?;
 
         // Transfer GAME into staking vault.
         let cpi_ctx = CpiContext::new(
@@ -270,11 +264,9 @@ pub mod x1_mining_arena {
         );
         token::transfer(cpi_ctx, amount)?;
 
-        let prev_effective = stake_position.effective_stake;
-        let new_amount = stake_position.amount_staked.saturating_add(amount);
-        let effective = calculate_effective(new_amount, lock_multiplier_bps, boost_multiplier_bps)?;
+        let effective = calculate_effective(amount, lock_multiplier_bps, boost_multiplier_bps)?;
 
-        stake_position.amount_staked = new_amount;
+        stake_position.amount_staked = amount;
         stake_position.lock_multiplier_bps = lock_multiplier_bps;
         stake_position.boost_multiplier_bps = boost_multiplier_bps;
         stake_position.effective_stake = effective;
@@ -289,10 +281,13 @@ pub mod x1_mining_arena {
             .accounts
             .staking_pool
             .total_effective_stake
-            .saturating_add(effective.saturating_sub(prev_effective));
+            .saturating_add(effective);
+
+        user_account.next_position_id = position_id.saturating_add(1);
 
         emit!(StakeEvent {
-            user: ctx.accounts.owner.key(),
+            owner: ctx.accounts.owner.key(),
+            position_id,
             amount,
             lock_days,
             effective,
@@ -302,12 +297,18 @@ pub mod x1_mining_arena {
     }
 
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
+        let position_id = assert_valid_user_stake_pda(
+            ctx.program_id,
+            &ctx.accounts.owner.key(),
+            Some(ctx.accounts.user_stake_position.position_id),
+            &ctx.accounts.user_stake_position.key(),
+        )?;
         require_keys_eq!(
             ctx.accounts.user_stake_position.owner,
             ctx.accounts.owner.key(),
             ArenaError::Unauthorized
         );
-        settle_rewards(
+        let claimed = settle_rewards(
             &mut ctx.accounts.staking_pool,
             &mut ctx.accounts.user_stake_position,
             &ctx.accounts.global_config,
@@ -316,11 +317,23 @@ pub mod x1_mining_arena {
             &ctx.accounts.token_program,
             ctx.bumps.global_config,
         )?;
+
+        emit!(ClaimEvent {
+            owner: ctx.accounts.owner.key(),
+            position_id,
+            rewards_claimed: claimed,
+        });
         Ok(())
     }
 
     pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
         let clock = Clock::get()?;
+        let position_id = assert_valid_user_stake_pda(
+            ctx.program_id,
+            &ctx.accounts.owner.key(),
+            Some(ctx.accounts.user_stake_position.position_id),
+            &ctx.accounts.user_stake_position.key(),
+        )?;
         require_keys_eq!(
             ctx.accounts.user_stake_position.owner,
             ctx.accounts.owner.key(),
@@ -367,7 +380,8 @@ pub mod x1_mining_arena {
         ctx.accounts.user_stake_position.reward_debt = 0;
 
         emit!(UnstakeEvent {
-            user: ctx.accounts.owner.key(),
+            owner: ctx.accounts.owner.key(),
+            position_id,
             amount,
         });
         Ok(())
@@ -542,10 +556,13 @@ pub struct UserStakePosition {
     pub effective_stake: u128,
     pub reward_debt: u128,
     pub lock_until_ts: i64,
+    pub position_id: u32,
 }
 
 impl UserStakePosition {
-    pub const LEN: usize = 32 + 8 + 2 + 2 + 16 + 16 + 8 + 8;
+    // Keep the total allocated size the same as before (8 bytes padding
+    // retained) so legacy accounts remain compatible.
+    pub const LEN: usize = 32 + 8 + 2 + 2 + 16 + 16 + 8 + 4 + 4;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
@@ -609,6 +626,7 @@ pub struct UserAccount {
     pub staking_xnt_earned: u64,
     pub last_day_id: i64,
     pub achievements: Achievements,
+    pub next_position_id: u32,
     pub active_boosts: Vec<UserBoost>,
 }
 
@@ -624,8 +642,9 @@ impl UserAccount {
         + 8                   // staking_xnt_earned
         + 8                   // last_day_id
         + 4                   // achievements
+        + 4                   // next_position_id
         + 4 + MAX_ACTIVE_BOOSTS * UserBoost::LEN
-        + 16; // padding
+        + 12; // padding (keeps total size stable after adding next_position_id)
 
     pub fn purge_expired(&mut self, now: i64) {
         self.active_boosts.retain(|b| !b.is_expired(now));
@@ -808,20 +827,24 @@ pub struct Stake<'info> {
     pub user_xnt_account: Box<Account<'info, TokenAccount>>,
     #[account(
         init_if_needed,
-        seeds = [USER_STAKE_SEED, owner.key().as_ref()],
-        bump,
-        payer = owner,
-        space = 8 + UserStakePosition::LEN
-    )]
-    pub user_stake_position: Box<Account<'info, UserStakePosition>>,
-    #[account(
-        init_if_needed,
         seeds = [USER_ACCOUNT_SEED, owner.key().as_ref()],
         bump,
         payer = owner,
         space = 8 + UserAccount::LEN
     )]
     pub user_account: Box<Account<'info, UserAccount>>,
+    #[account(
+        init,
+        seeds = [
+            USER_STAKE_SEED,
+            owner.key().as_ref(),
+            &user_account.next_position_id.max(1).to_le_bytes()
+        ],
+        bump,
+        payer = owner,
+        space = 8 + UserStakePosition::LEN
+    )]
+    pub user_stake_position: Box<Account<'info, UserStakePosition>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -845,11 +868,7 @@ pub struct Claim<'info> {
     pub treasury_xnt_vault: Account<'info, TokenAccount>,
     #[account(mut, constraint = user_xnt_account.mint == global_config.xnt_mint, constraint = user_xnt_account.owner == owner.key())]
     pub user_xnt_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        seeds = [USER_STAKE_SEED, owner.key().as_ref()],
-        bump
-    )]
+    #[account(mut, owner = crate::ID)]
     pub user_stake_position: Account<'info, UserStakePosition>,
     pub token_program: Program<'info, Token>,
 }
@@ -876,11 +895,7 @@ pub struct Unstake<'info> {
     pub user_game_account: Account<'info, TokenAccount>,
     #[account(mut, constraint = user_xnt_account.mint == global_config.xnt_mint, constraint = user_xnt_account.owner == owner.key())]
     pub user_xnt_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        seeds = [USER_STAKE_SEED, owner.key().as_ref()],
-        bump
-    )]
+    #[account(mut, owner = crate::ID, close = owner)]
     pub user_stake_position: Account<'info, UserStakePosition>,
     pub token_program: Program<'info, Token>,
 }
@@ -1165,6 +1180,32 @@ fn pending_rewards(acc_reward_per_share: u128, user_stake: &UserStakePosition) -
     Ok(pending.min(u64::MAX as u128) as u64)
 }
 
+fn assert_valid_user_stake_pda(
+    program_id: &Pubkey,
+    owner: &Pubkey,
+    maybe_position_id: Option<u32>,
+    stake_account_key: &Pubkey,
+) -> Result<u32> {
+    if maybe_position_id == Some(0) || maybe_position_id.is_none() {
+        let (legacy_pda, _) =
+            Pubkey::find_program_address(&[USER_STAKE_SEED, owner.as_ref()], program_id);
+        require_keys_eq!(*stake_account_key, legacy_pda, ArenaError::InvalidStakePda);
+        return Ok(0);
+    }
+
+    let position_id = maybe_position_id.unwrap();
+    let (pda, _) = Pubkey::find_program_address(
+        &[
+            USER_STAKE_SEED,
+            owner.as_ref(),
+            &position_id.to_le_bytes(),
+        ],
+        program_id,
+    );
+    require_keys_eq!(*stake_account_key, pda, ArenaError::InvalidStakePda);
+    Ok(position_id)
+}
+
 // -------------------------------------
 // Events
 // -------------------------------------
@@ -1180,7 +1221,8 @@ pub struct MiningEvent {
 
 #[event]
 pub struct StakeEvent {
-    pub user: Pubkey,
+    pub owner: Pubkey,
+    pub position_id: u32,
     pub amount: u64,
     pub lock_days: u16,
     pub effective: u128,
@@ -1188,8 +1230,16 @@ pub struct StakeEvent {
 
 #[event]
 pub struct UnstakeEvent {
-    pub user: Pubkey,
+    pub owner: Pubkey,
+    pub position_id: u32,
     pub amount: u64,
+}
+
+#[event]
+pub struct ClaimEvent {
+    pub owner: Pubkey,
+    pub position_id: u32,
+    pub rewards_claimed: u64,
 }
 
 #[event]
@@ -1229,4 +1279,6 @@ pub enum ArenaError {
     InsufficientBoostPoints,
     #[msg("Configuration incomplete")]
     IncompleteConfig,
+    #[msg("Invalid stake PDA")]
+    InvalidStakePda,
 }

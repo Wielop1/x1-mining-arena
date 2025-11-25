@@ -11,7 +11,13 @@ import {
   TOKEN_PROGRAM_ID,
   getOrCreateAssociatedTokenAccount,
 } from "@solana/spl-token";
+import { BorshAccountsCoder, Idl } from "@coral-xyz/anchor";
 import fs from "fs";
+
+// Lazy-load the IDL coder for decoding program accounts in scripts.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const idl = require("../target/idl/x1_mining_arena.json") as Idl;
+const coder = new BorshAccountsCoder(idl);
 
 export function loadKeypair(path: string): Keypair {
   const secret = JSON.parse(fs.readFileSync(path, "utf8"));
@@ -60,6 +66,22 @@ export async function sendTx(
     ...extraSigners,
   ]);
   return sig;
+}
+
+export function decodeUserAccount(data: Buffer) {
+  return coder.decode("userAccount", data);
+}
+
+export function decodeUserStakePosition(data: Buffer) {
+  return coder.decode("userStakePosition", data);
+}
+
+export function decodeGlobalConfig(data: Buffer) {
+  return coder.decode("globalConfig", data);
+}
+
+export function decodeStakingPool(data: Buffer) {
+  return coder.decode("stakingPool", data);
 }
 
 export { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID };

@@ -12,19 +12,16 @@ async function main() {
   const XNT_MINT = new PublicKey(
     "So11111111111111111111111111111111111111112"
   );
-  const GAME_MINT = new PublicKey(
-    "2iz7CgsTQifAg1z1wkC7MNj876hENnDP55PLpg1KsbVr"
-  );
+
+  // Game mint keypair must be signable (we init it on-chain). Default path can be overridden via GAME_MINT_KEYPAIR.
+  const gameMintKeypairPath =
+    process.env.GAME_MINT_KEYPAIR || "/root/.config/solana/game-mint.json";
+  const gameMintKeypair = loadKeypair(gameMintKeypairPath);
+  const GAME_MINT = gameMintKeypair.publicKey;
 
   const [globalConfig, globalBump] = findGlobalConfig(PROGRAM_ID);
 
-  // Ensure admin ATAs (requested).
-  const adminGameAta = await ensureAta({
-    connection,
-    payer: admin,
-    mint: GAME_MINT,
-    owner: admin.publicKey,
-  });
+  // Ensure admin XNT ATA (GAME mint ATA tworzymy dopiero po utworzeniu mintu w on-chain init).
   const adminXntAta = await ensureAta({
     connection,
     payer: admin,
@@ -45,12 +42,17 @@ async function main() {
         stakingShareBps: 3000,
       }),
     ],
-    []
+    [gameMintKeypair]
   );
 
   console.log("initializeGlobal signature:", sig);
   console.log("GlobalConfig PDA:", globalConfig.toBase58(), "bump", globalBump);
-  console.log("Admin GAME ATA:", adminGameAta.toBase58());
+  console.log(
+    "GAME mint pubkey:",
+    GAME_MINT.toBase58(),
+    "keypair:",
+    gameMintKeypairPath
+  );
   console.log("Admin XNT ATA:", adminXntAta.toBase58());
 }
 

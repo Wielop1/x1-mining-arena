@@ -32,6 +32,23 @@ export function findUserStake(user: PublicKey, programId: PublicKey) {
   );
 }
 
+export function findLegacyUserStake(user: PublicKey, programId: PublicKey) {
+  return findUserStake(user, programId);
+}
+
+export function findUserStakePosition(
+  user: PublicKey,
+  positionId: number,
+  programId: PublicKey
+) {
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32LE(positionId);
+  return PublicKey.findProgramAddressSync(
+    [PDA_SEEDS.userStake, user.toBuffer(), buf],
+    programId
+  );
+}
+
 export function findBoostConfig(id: number, programId: PublicKey) {
   return PublicKey.findProgramAddressSync(
     [PDA_SEEDS.boostConfig, Buffer.from([id])],
